@@ -1,0 +1,491 @@
+name: Build Priva
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate Priva project
+        run: |
+          mkdir -p build-priva/src/main/java/ru/eclips/priva
+          mkdir -p build-priva/src/main/resources
+
+          cat > build-priva/pom.xml <<'POM_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>ru.eclips</groupId>
+            <artifactId>Priva</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+
+            <properties>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              <maven.compiler.release>17</maven.compiler.release>
+            </properties>
+
+            <repositories>
+              <repository>
+                <id>nukkit-mot</id>
+                <url>https://repo.lanink.cn/repository/maven-public/</url>
+              </repository>
+              <repository>
+                <id>opencollab-snapshots</id>
+                <url>https://repo.opencollab.dev/maven-snapshots/</url>
+              </repository>
+            </repositories>
+
+            <dependencies>
+              <dependency>
+                <groupId>cn.nukkit</groupId>
+                <artifactId>Nukkit</artifactId>
+                <version>MOT-SNAPSHOT</version>
+                <scope>provided</scope>
+              </dependency>
+              <dependency>
+                <groupId>net.luckperms</groupId>
+                <artifactId>api</artifactId>
+                <version>5.4</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+
+            <build>
+              <finalName>Priva</finalName>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.11.0</version>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          POM_EOF
+
+          cat > build-priva/src/main/resources/plugin.yml <<'YML_EOF'
+          name: Priva
+          main: ru.eclips.priva.Priva
+          version: 1.0.0
+          api: ["1.0.0"]
+          author: Eclips
+          depend: ["LuckPerms"]
+          description: GUI menu for giving and removing privileges
+          commands:
+            priva:
+              description: Privileges menu
+              usage: /priva
+              permission: priva.use
+          permissions:
+            priva.use:
+              description: Access to /priva
+              default: false
+          YML_EOF
+
+          cat > build-priva/src/main/resources/config.yml <<'CFG_EOF'
+          # Группы LuckPerms, которые никогда не показываются и не выдаются.
+          # admin исключён всегда, даже если убрать его отсюда.
+          excluded-groups:
+            - admin
+            - default
+            - op
+
+          # true: сверху группы с меньшим весом, false: сверху с большим
+          sort-ascending: true
+          CFG_EOF
+
+          cat > build-priva/src/main/java/ru/eclips/priva/Priva.java <<'JAVA_EOF'
+          package ru.eclips.priva;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerFormRespondedEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.form.element.ElementButton;
+          import cn.nukkit.form.element.ElementInput;
+          import cn.nukkit.form.element.ElementLabel;
+          import cn.nukkit.form.response.FormResponse;
+          import cn.nukkit.form.response.FormResponseCustom;
+          import cn.nukkit.form.response.FormResponseModal;
+          import cn.nukkit.form.response.FormResponseSimple;
+          import cn.nukkit.form.window.FormWindow;
+          import cn.nukkit.form.window.FormWindowCustom;
+          import cn.nukkit.form.window.FormWindowModal;
+          import cn.nukkit.form.window.FormWindowSimple;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.utils.TextFormat;
+          import net.luckperms.api.LuckPerms;
+          import net.luckperms.api.LuckPermsProvider;
+          import net.luckperms.api.model.group.Group;
+          import net.luckperms.api.model.user.User;
+          import net.luckperms.api.node.NodeType;
+          import net.luckperms.api.node.types.InheritanceNode;
+          import net.luckperms.api.query.QueryOptions;
+
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.CompletableFuture;
+          import java.util.concurrent.ConcurrentHashMap;
+          import java.util.function.Consumer;
+
+          public class Priva extends PluginBase implements Listener {
+
+              private enum Mode { GIVE, REMOVE }
+
+              private record Pending(int id, Consumer<FormResponse> handler) {}
+
+              private record Online(UUID uuid, String name) {}
+
+              private LuckPerms lp;
+              private final Set<String> excluded = new HashSet<>();
+              private boolean ascending = true;
+              private final Map<UUID, Pending> pending = new ConcurrentHashMap<>();
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  try {
+                      lp = LuckPermsProvider.get();
+                  } catch (Throwable t) {
+                      getLogger().error("LuckPerms не найден, Priva выключен", t);
+                      getServer().getPluginManager().disablePlugin(this);
+                      return;
+                  }
+                  for (String s : getConfig().getStringList("excluded-groups")) {
+                      excluded.add(s.toLowerCase());
+                  }
+                  excluded.add("admin");
+                  ascending = getConfig().getBoolean("sort-ascending", true);
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getLogger().info("Priva включен");
+              }
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!command.getName().equalsIgnoreCase("priva")) return false;
+                  if (!(sender instanceof Player p)) {
+                      sender.sendMessage("Команда только для игроков");
+                      return true;
+                  }
+                  if (!p.hasPermission("priva.use")) {
+                      p.sendMessage("§cУ тебя нет прав на эту команду");
+                      return true;
+                  }
+                  openMain(p);
+                  return true;
+              }
+
+              // ---------- формы: отправка и приём ----------
+
+              private void sync(Runnable r) {
+                  getServer().getScheduler().scheduleTask(this, r);
+              }
+
+              private void show(Player p, FormWindow w, Consumer<FormResponse> handler) {
+                  getServer().getScheduler().scheduleDelayedTask(this, () -> {
+                      if (!p.isOnline()) return;
+                      int id = p.showFormWindow(w);
+                      pending.put(p.getUniqueId(), new Pending(id, handler));
+                  }, 3);
+              }
+
+              @EventHandler
+              public void onForm(PlayerFormRespondedEvent e) {
+                  UUID uuid = e.getPlayer().getUniqueId();
+                  Pending pd = pending.get(uuid);
+                  if (pd == null || pd.id() != e.getFormID()) return;
+                  pending.remove(uuid);
+                  if (e.wasClosed() || e.getResponse() == null) return;
+                  try {
+                      pd.handler().accept(e.getResponse());
+                  } catch (Exception ex) {
+                      getLogger().error("Ошибка в меню Priva", ex);
+                      e.getPlayer().sendMessage("§cОшибка меню, попробуй ещё раз");
+                  }
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  pending.remove(e.getPlayer().getUniqueId());
+              }
+
+              // ---------- данные из LuckPerms ----------
+
+              private int groupWeight(Group g) {
+                  return g.getWeight().orElse(0);
+              }
+
+              private int playerWeight(Player p) {
+                  User u = lp.getUserManager().getUser(p.getUniqueId());
+                  if (u == null) return 0;
+                  return u.getInheritedGroups(QueryOptions.nonContextual())
+                          .stream().mapToInt(this::groupWeight).max().orElse(0);
+              }
+
+              private String prefixOf(Group g) {
+                  try {
+                      String pr = g.getCachedData().getMetaData().getPrefix();
+                      if (pr == null) return null;
+                      return TextFormat.colorize('&', pr).trim();
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              private String shortName(Group g) {
+                  String pr = prefixOf(g);
+                  if (pr == null || pr.isBlank()) return "§f" + g.getName();
+                  return pr;
+              }
+
+              private String label(Group g) {
+                  return shortName(g) + "§r\n§7" + g.getName() + " §8| §7вес §f" + groupWeight(g);
+              }
+
+              /** mode == null: все группы без фильтра по весу (для списка). */
+              private List<Group> listGroups(Mode mode, int myWeight) {
+                  List<Group> out = new ArrayList<>();
+                  for (Group g : lp.getGroupManager().getLoadedGroups()) {
+                      if (excluded.contains(g.getName().toLowerCase())) continue;
+                      int w = groupWeight(g);
+                      if (mode == Mode.GIVE && w >= myWeight) continue;
+                      if (mode == Mode.REMOVE && w > myWeight) continue;
+                      out.add(g);
+                  }
+                  Comparator<Group> c = Comparator.comparingInt(this::groupWeight)
+                          .thenComparing(Group::getName);
+                  out.sort(ascending ? c : c.reversed());
+                  return out;
+              }
+
+              // ---------- меню ----------
+
+              private void openMain(Player p) {
+                  FormWindowSimple w = new FormWindowSimple("§l§6Привилегии", "§7Выбери действие");
+                  w.addButton(new ElementButton("§aВыдать привилегию"));
+                  w.addButton(new ElementButton("§cСнять привилегию"));
+                  w.addButton(new ElementButton("§eСписок привилегий"));
+                  show(p, w, r -> {
+                      int id = ((FormResponseSimple) r).getClickedButtonId();
+                      switch (id) {
+                          case 0 -> openGroups(p, Mode.GIVE);
+                          case 1 -> openGroups(p, Mode.REMOVE);
+                          case 2 -> openList(p);
+                          default -> { }
+                      }
+                  });
+              }
+
+              private void openList(Player p) {
+                  StringBuilder sb = new StringBuilder();
+                  for (Group g : listGroups(null, 0)) {
+                      sb.append(shortName(g)).append("§r §7— ").append(g.getName())
+                        .append(" §8(вес ").append(groupWeight(g)).append(")§r\n");
+                  }
+                  if (sb.length() == 0) sb.append("§7Привилегий нет");
+                  FormWindowSimple w = new FormWindowSimple("§l§eСписок привилегий", sb.toString());
+                  w.addButton(new ElementButton("§8◀ Назад"));
+                  show(p, w, r -> openMain(p));
+              }
+
+              private void openGroups(Player p, Mode mode) {
+                  int my = playerWeight(p);
+                  List<Group> gs = listGroups(mode, my);
+                  if (gs.isEmpty()) {
+                      p.sendMessage("§cНет доступных тебе привилегий");
+                      openMain(p);
+                      return;
+                  }
+                  String title = mode == Mode.GIVE ? "§l§aВыдать привилегию" : "§l§cСнять привилегию";
+                  FormWindowSimple w = new FormWindowSimple(title, "§7Выбери привилегию");
+                  List<String> names = new ArrayList<>();
+                  for (Group g : gs) {
+                      w.addButton(new ElementButton(label(g)));
+                      names.add(g.getName());
+                  }
+                  w.addButton(new ElementButton("§8◀ Назад"));
+                  show(p, w, r -> {
+                      int id = ((FormResponseSimple) r).getClickedButtonId();
+                      if (id >= names.size()) {
+                          openMain(p);
+                          return;
+                      }
+                      openTarget(p, mode, names.get(id));
+                  });
+              }
+
+              private void openTarget(Player p, Mode mode, String groupName) {
+                  FormWindowSimple w = new FormWindowSimple("§l§6Кому", "§7Выбери способ");
+                  w.addButton(new ElementButton("§aВыбрать игрока онлайн"));
+                  w.addButton(new ElementButton("§bПо нику"));
+                  w.addButton(new ElementButton("§8◀ Назад"));
+                  show(p, w, r -> {
+                      int id = ((FormResponseSimple) r).getClickedButtonId();
+                      switch (id) {
+                          case 0 -> openOnline(p, mode, groupName);
+                          case 1 -> openNick(p, mode, groupName);
+                          default -> openGroups(p, mode);
+                      }
+                  });
+              }
+
+              private void openOnline(Player p, Mode mode, String groupName) {
+                  List<Player> list = new ArrayList<>(getServer().getOnlinePlayers().values());
+                  list.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+                  FormWindowSimple w = new FormWindowSimple("§l§6Игроки онлайн", "§7Выбери игрока");
+                  List<Online> snapshot = new ArrayList<>();
+                  for (Player pl : list) {
+                      w.addButton(new ElementButton("§f" + pl.getName()));
+                      snapshot.add(new Online(pl.getUniqueId(), pl.getName()));
+                  }
+                  w.addButton(new ElementButton("§8◀ Назад"));
+                  show(p, w, r -> {
+                      int id = ((FormResponseSimple) r).getClickedButtonId();
+                      if (id >= snapshot.size()) {
+                          openTarget(p, mode, groupName);
+                          return;
+                      }
+                      Online t = snapshot.get(id);
+                      confirm(p, mode, groupName, t.uuid(), t.name());
+                  });
+              }
+
+              private void openNick(Player p, Mode mode, String groupName) {
+                  FormWindowCustom w = new FormWindowCustom("§l§bПо нику");
+                  w.addElement(new ElementLabel("§7Введи ник игрока и нажми «Отправить». Чтобы выйти, закрой окно."));
+                  w.addElement(new ElementInput("Ник игрока", "Steve"));
+                  show(p, w, r -> {
+                      String nick = ((FormResponseCustom) r).getInputResponse(1);
+                      nick = nick == null ? "" : nick.trim();
+                      if (nick.isEmpty()) {
+                          p.sendMessage("§cНик не введён");
+                          openNick(p, mode, groupName);
+                          return;
+                      }
+                      Player online = getServer().getPlayerExact(nick);
+                      if (online != null) {
+                          confirm(p, mode, groupName, online.getUniqueId(), online.getName());
+                          return;
+                      }
+                      final String finalNick = nick;
+                      lp.getUserManager().lookupUniqueId(finalNick).whenComplete((uuid, ex) -> sync(() -> {
+                          if (ex != null || uuid == null) {
+                              p.sendMessage("§cИгрок §e" + finalNick + " §cне найден");
+                              openNick(p, mode, groupName);
+                              return;
+                          }
+                          confirm(p, mode, groupName, uuid, finalNick);
+                      }));
+                  });
+              }
+
+              private void confirm(Player p, Mode mode, String groupName, UUID uuid, String name) {
+                  Group g = lp.getGroupManager().getGroup(groupName);
+                  if (g == null) {
+                      p.sendMessage("§cПривилегия не найдена");
+                      openMain(p);
+                      return;
+                  }
+                  String text = mode == Mode.GIVE
+                          ? "§fВыдать привилегию " + shortName(g) + "§r§f игроку §e" + name + "§f?"
+                          : "§fСнять привилегию " + shortName(g) + "§r§f у игрока §e" + name + "§f?";
+                  FormWindowModal w = new FormWindowModal("§l§6Подтверждение", text, "§aПодтвердить", "§cОтмена");
+                  show(p, w, r -> {
+                      if (((FormResponseModal) r).getClickedButtonId() == 0) {
+                          execute(p, mode, groupName, uuid, name);
+                      } else {
+                          openMain(p);
+                      }
+                  });
+              }
+
+              // ---------- выдача / снятие ----------
+
+              private void execute(Player admin, Mode mode, String groupName, UUID uuid, String name) {
+                  Group g = lp.getGroupManager().getGroup(groupName);
+                  if (g == null || excluded.contains(g.getName().toLowerCase())) {
+                      admin.sendMessage("§cЭту привилегию нельзя использовать");
+                      return;
+                  }
+                  int my = playerWeight(admin);
+                  int gw = groupWeight(g);
+                  if (mode == Mode.GIVE && gw >= my) {
+                      admin.sendMessage("§cНельзя выдать привилегию, вес которой равен или выше твоего");
+                      return;
+                  }
+                  if (mode == Mode.REMOVE && gw > my) {
+                      admin.sendMessage("§cНельзя снять привилегию, вес которой выше твоего");
+                      return;
+                  }
+
+                  String shown = shortName(g);
+                  String gname = g.getName();
+                  InheritanceNode node = InheritanceNode.builder(g).build();
+
+                  lp.getUserManager().loadUser(uuid).thenCompose(user -> {
+                      boolean has = user.getNodes(NodeType.INHERITANCE).stream()
+                              .anyMatch(n -> n.getGroupName().equalsIgnoreCase(gname));
+                      if (mode == Mode.GIVE) {
+                          if (has) {
+                              sync(() -> admin.sendMessage("§eУ игрока " + name + " уже есть " + shown));
+                              return CompletableFuture.<Void>completedFuture(null);
+                          }
+                          user.data().add(node);
+                      } else {
+                          if (!has) {
+                              sync(() -> admin.sendMessage("§eУ игрока " + name + " нет привилегии " + shown));
+                              return CompletableFuture.<Void>completedFuture(null);
+                          }
+                          user.data().clear(NodeType.INHERITANCE.predicate(n -> n.getGroupName().equalsIgnoreCase(gname)));
+                      }
+                      return lp.getUserManager().saveUser(user).thenRun(() -> sync(() -> {
+                          if (mode == Mode.GIVE) {
+                              admin.sendMessage("§aИгроку §e" + name + " §aвыдана привилегия " + shown);
+                              Player target = getServer().getOnlinePlayers().get(uuid);
+                              if (target != null) target.sendMessage("§aТебе выдана привилегия " + shown);
+                              getLogger().info(admin.getName() + " выдал " + gname + " игроку " + name);
+                          } else {
+                              admin.sendMessage("§aУ игрока §e" + name + " §aснята привилегия " + shown);
+                              Player target = getServer().getOnlinePlayers().get(uuid);
+                              if (target != null) target.sendMessage("§cУ тебя снята привилегия " + shown);
+                              getLogger().info(admin.getName() + " снял " + gname + " у игрока " + name);
+                          }
+                      }));
+                  }).exceptionally(ex -> {
+                      getLogger().error("Ошибка LuckPerms", ex);
+                      sync(() -> admin.sendMessage("§cОшибка LuckPerms, подробности в консоли"));
+                      return null;
+                  });
+              }
+          }
+          JAVA_EOF
+
+      - name: Build with Maven
+        working-directory: build-priva
+        run: mvn -B -q package
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: Priva
+          path: build-priva/target/Priva.jar
